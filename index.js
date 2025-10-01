@@ -8,15 +8,20 @@ const
     bodyParser = require('body-parser'),
     axios = require('axios'),
     querystring = require('querystring'),
+    { createClient } = require('@supabase/supabase-js'),
     // creates express http server
     app = express().use(bodyParser.json());
 
-const stravaUrl = "https://strava-node-api-203308554831.us-central1.run.app"
-const runawayUrl = "https://runaway-node-api-203308554831.us-central1.run.app"
-const runawayRefeshTokensUrl = "https://runaway-node-api-203308554831.us-central1.run.app/refresh-tokens"
-
+// Strava API configuration
+const STRAVA_API_BASE = "https://www.strava.com/api/v3";
 const clientID = process.env.STRAVA_CLIENT_ID;
 const clientSecret = process.env.STRAVA_CLIENT_SECRET;
+
+// Supabase configuration
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_KEY
+);
 
 let accessToken = '';
 let refreshToken = '';
@@ -43,22 +48,19 @@ async function refreshAccessToken(athleteId) {
             throw new Error('No athlete ID available for token refresh');
         }
 
-        // First get new tokens from runaway service
-        const runawayResponse = await axios.get(`${runawayRefeshTokensUrl}/${athleteId}`)
-            .catch(error => {
-                throw new Error(`Failed to fetch from runaway service: ${error.message}`);
-            });
+        // Get stored refresh token from Supabase
+        const { data: userData, error: fetchError } = await supabase
+            .from('athletes')
+            .select('refresh_token')
+            .eq('id', athleteId)
+            .single();
 
-        console.log('Runaway response:', runawayResponse.data);
-
-        const storedRefreshToken = runawayResponse.data.refresh_token;
-        if (!storedRefreshToken) {
-            throw new Error('No refresh token found in runaway service');
+        if (fetchError || !userData?.refresh_token) {
+            throw new Error(`No refresh token found for athlete ${athleteId}: ${fetchError?.message}`);
         }
 
-        console.log('Stored refresh token:', storedRefreshToken);
-        console.log('Client ID:', clientID);
-        console.log('Client secret:', clientSecret);
+        const storedRefreshToken = userData.refresh_token;
+        console.log('Stored refresh token found for athlete:', athleteId);
 
         // Use the stored refresh token to get new access token from Strava
         const tokenResponse = await axios.post('https://www.strava.com/oauth/token', querystring.stringify({
@@ -75,21 +77,22 @@ async function refreshAccessToken(athleteId) {
         accessToken = tokenResponse.data.access_token;
         refreshToken = tokenResponse.data.refresh_token;
 
-        // Update the stored tokens in runaway service
-        console.log('athleteId:', athleteId);
+        // Update the stored tokens in Supabase
+        const { error: updateError } = await supabase
+            .from('athletes')
+            .update({
+                access_token: accessToken,
+                refresh_token: refreshToken,
+                token_expires_at: new Date(tokenResponse.data.expires_at * 1000).toISOString()
+            })
+            .eq('id', athleteId);
 
-        await axios.post(`${runawayUrl}/tokens`, {
-            user_id: athleteId,
-            access_token: accessToken,
-            refresh_token: refreshToken,
-            expires_at: tokenResponse.data.expires_at
-        }).catch(error => {
-            console.error('Failed to update runaway service:', error.message);
+        if (updateError) {
+            console.error('Failed to update tokens in Supabase:', updateError.message);
             // Continue execution even if update fails
-        });
+        }
 
         console.log('Token refreshed successfully');
-        console.log('New access token:', accessToken);
         return accessToken;
     } catch (error) {
         console.error('Token refresh failed:', {
@@ -102,6 +105,66 @@ async function refreshAccessToken(athleteId) {
 
 // Sets server port and logs message on success
 app.listen(process.env.PORT || 8080, () => console.log('webhook is listening'));
+
+// Root endpoint - show authorization link
+app.get('/', (req, res) => {
+    const redirectUri = `${req.protocol}://${req.get('host')}/callback`;
+    const authUrl = `https://www.strava.com/oauth/authorize?client_id=${clientID}&response_type=code&redirect_uri=${redirectUri}&approval_prompt=force&scope=activity:read_all,profile:read_all`;
+    res.send(`<h1>Strava Webhook Service</h1><p><a href="${authUrl}">Connect with Strava</a></p>`);
+});
+
+// OAuth callback endpoint
+app.get('/callback', async (req, res) => {
+    const code = req.query.code;
+
+    if (!code) {
+        return res.status(400).send('No authorization code provided');
+    }
+
+    try {
+        // Exchange authorization code for tokens
+        const tokenResponse = await axios.post('https://www.strava.com/oauth/token', {
+            client_id: clientID,
+            client_secret: clientSecret,
+            code: code,
+            grant_type: 'authorization_code'
+        });
+
+        const { access_token, refresh_token, expires_at, athlete } = tokenResponse.data;
+
+        // Store tokens and athlete data in Supabase
+        const athleteData = {
+            id: athlete.id,
+            first_name: athlete.firstname,
+            last_name: athlete.lastname,
+            email: athlete.email,
+            sex: athlete.sex,
+            weight: athlete.weight || 0,
+            city: athlete.city,
+            state: athlete.state,
+            country: athlete.country,
+            premium: athlete.premium || false,
+            created_at: athlete.created_at,
+            updated_at: new Date().toISOString(),
+            access_token: access_token,
+            refresh_token: refresh_token,
+            token_expires_at: new Date(expires_at * 1000).toISOString()
+        };
+
+        const { error } = await supabase
+            .from('athletes')
+            .upsert(athleteData, { onConflict: 'id' });
+
+        if (error) {
+            throw error;
+        }
+
+        res.send(`<h1>Success!</h1><p>Athlete ${athlete.firstname} ${athlete.lastname} (ID: ${athlete.id}) connected successfully. Tokens stored.</p>`);
+    } catch (error) {
+        console.error('OAuth callback error:', error);
+        res.status(500).send(`Error: ${error.message}`);
+    }
+});
 
 // Creates the endpoint for our webhook
 app.post('/webhook', async (req, res) => {
@@ -131,13 +194,15 @@ app.post('/webhook', async (req, res) => {
 
             console.log('Access token:', accessToken);
 
-            // Make authenticated GET request to Strava API
+            // Make authenticated GET requests to Strava API
+            const headers = {
+                'Authorization': `Bearer ${accessToken}`
+            };
+
             let activityData;
             try {
-                const stravaUrlWithTokenandActivity = `${stravaUrl}/activities/${athleteId}/${activityId}?access_token=${accessToken}`;
-                console.log('Fetching activity from Strava:', stravaUrlWithTokenandActivity);
-
-                const activityResponse = await axios.get(`${stravaUrl}/activities/${athleteId}/${activityId}`);
+                console.log('Fetching activity from Strava API:', activityId);
+                const activityResponse = await axios.get(`${STRAVA_API_BASE}/activities/${activityId}`, { headers });
                 activityData = activityResponse.data;
                 console.log('Activity details:', activityData);
             } catch (error) {
@@ -149,7 +214,8 @@ app.post('/webhook', async (req, res) => {
             // Fetch athlete details
             let athleteData;
             try {
-                const athleteResponse = await axios.get(`${stravaUrl}/athlete/${athleteId}`);
+                console.log('Fetching athlete from Strava API:', athleteId);
+                const athleteResponse = await axios.get(`${STRAVA_API_BASE}/athlete`, { headers });
                 athleteData = athleteResponse.data;
                 console.log('Athlete details:', athleteData);
             } catch (error) {
@@ -158,35 +224,35 @@ app.post('/webhook', async (req, res) => {
                 return;
             }
 
-            // Fetch athlete stats
-            let athleteStatsData;
-            try {
-                const athleteStatsResponse = await axios.get(`${stravaUrl}/athlete/stats/${athleteId}`);
-                athleteStatsData = athleteStatsResponse.data;
-                console.log('Athlete stats:', athleteStatsData);
-            } catch (error) {
-                console.error('Failed to fetch athlete stats:', error.message);
-                handleError(error, res);
-                return;
-            }
+            // Note: Skipping athlete stats since we don't have that table in current schema
 
-            // Make POST requests to Runaway API
+            // Save data to Supabase
             try {
                 const transformedActivityData = transformActivityData(athleteId, activityData);
                 const transformedAthleteData = transformAthleteData(athleteId, athleteData);
-                const transformedAthleteStatsData = transformAthleteStatsData(athleteId, athleteStatsData);
-                const transformedMapData = transformMapData(activityData);
 
-                await Promise.all([
-                    axios.post(`${runawayUrl}/activities`, transformedActivityData),
-                    axios.post(`${runawayUrl}/athletes/${athleteId}`, transformedAthleteData),
-                    axios.post(`${runawayUrl}/athletes/${athleteId}/stats`, transformedAthleteStatsData),
-                    axios.post(`${runawayUrl}/maps`, transformedMapData)
+                console.log('Saving activity data:', transformedActivityData);
+                console.log('Saving athlete data:', transformedAthleteData);
+
+                // Save data to Supabase in parallel
+                const [activityResult, athleteResult] = await Promise.all([
+                    supabase.from('activities').upsert(transformedActivityData, { onConflict: 'id' }),
+                    supabase.from('athletes').upsert(transformedAthleteData, { onConflict: 'id' })
                 ]);
 
+                // Check for errors
+                const errors = [activityResult.error, athleteResult.error].filter(Boolean);
+                if (errors.length > 0) {
+                    console.error('Supabase errors:', errors);
+                    throw new Error(`Failed to save data to Supabase: ${errors.map(e => e.message).join(', ')}`);
+                }
+
+                console.log('Data saved successfully to Supabase');
+                console.log('Activity result:', activityResult.data);
+                console.log('Athlete result:', athleteResult.data);
                 res.status(200).send('EVENT_RECEIVED');
             } catch (error) {
-                console.error('Failed to save data to Runaway:', error.message);
+                console.error('Failed to save data to Supabase:', error.message);
                 handleError(error, res);
                 return;
             }
@@ -219,47 +285,67 @@ app.get('/webhook', (req, res) => {
     }
 });
 
+// Map Strava sport_type to activity_type_id
+function getActivityTypeId(sportType) {
+    const typeMap = {
+        'Run': 103,
+        'Ride': 104,
+        'Walk': 105,
+        'Hike': 106,
+        'VirtualRide': 107,
+        'VirtualRun': 108,
+        'Swim': 109,
+        'Workout': 110,
+        'WeightTraining': 111,
+        'Yoga': 112,
+        'Crossfit': 113,
+        'Elliptical': 114,
+        'Rowing': 115,
+        'RockClimbing': 116,
+        'AlpineSki': 117,
+        'Snowboard': 118,
+        'MountainBikeRide': 119,
+        'GravelRide': 120,
+        'TrailRun': 121,
+        'Golf': 123
+    };
+    return typeMap[sportType] || 110; // Default to Workout (110) if unknown
+}
+
 // create a function that gets the full bodu of the strava activity by the activity id
 function transformActivityData(athleteId, record) {
     const transformedData = {
-        external_id: record.id?.toString(),
-        upload_id: record.upload_id,
+        id: record.id,
+        athlete_id: athleteId,
         name: record.name,
-        type: record.type == 'WeightTraining' ? 'Weight Training' : record.type,
-        detail: record.description,
-        distance: record.distance,
-        moving_time: record.moving_time,
+        description: record.description || '',
+        activity_type_id: getActivityTypeId(record.sport_type || record.type),
+        activity_date: record.start_date,
+        start_time: record.start_date_local,
         elapsed_time: record.elapsed_time,
-        high_elevation: record.elev_high,
-        low_elevation: record.elev_low,
-        total_elevation_gain: record.total_elevation_gain,
-        start_date: record.start_date,
-        start_date_local: record.start_date_local,
-        time_zone: record.timezone,
-        achievement_count: record.achievement_count || 0,
-        kudos_count: record.kudos_count || 0,
-        comment_count: record.comment_count || 0,
-        athlete_count: record.athlete_count || 1,
-        photo_count: record.photo_count || 0,
-        total_photo_count: record.total_photo_count || 0,
-        trainer: record.trainer || false,
+        moving_time: record.moving_time,
+        distance: record.distance,
+        elevation_gain: record.total_elevation_gain,
+        elevation_high: record.elev_high,
+        elevation_low: record.elev_low,
+        max_speed: record.max_speed,
+        average_speed: record.average_speed,
+        max_heart_rate: record.max_heartrate ? Math.round(record.max_heartrate) : null,
+        average_heart_rate: record.average_heartrate ? Math.round(record.average_heartrate) : null,
+        has_heartrate: record.has_heartrate || false,
+        max_watts: record.max_watts,
+        average_watts: record.average_watts,
+        device_watts: record.device_watts || false,
+        calories: record.calories || 1,
         commute: record.commute || false,
+        flagged: record.flagged || false,
+        trainer: record.trainer || false,
         manual: record.manual || false,
         private: record.private || false,
-        flagged: record.flagged || false,
-        average_speed: record.average_speed,
-        max_speed: record.max_speed,
-        calories: record.calories,
-        has_kudoed: record.has_kudoed || false,
-        kilo_joules: record.kilojoules,
-        average_power: record.average_watts,
-        max_power: record.max_watts,
-        device_watts: record.device_watts || false,
-        has_heart_rate: record.has_heartrate || false,
-        average_heart_rate: record.average_heartrate,
-        max_heart_rate: record.max_heartrate,
-        user_id: athleteId,
-        map_id: record.map.id
+        external_id: record.id?.toString(),
+        filename: record.upload_id ? `activities/${record.upload_id}.fit.gz` : null,
+        from_upload: true,
+        resource_state: 2
     };
 
     // Convert any undefined values to null
@@ -274,23 +360,18 @@ function transformActivityData(athleteId, record) {
 
 function transformAthleteData(athleteId, athleteData) {
     const transformedData = {
-        user_id: athleteId,
-        firstname: athleteData.firstname,
-        lastname: athleteData.lastname,
-        profile_medium: athleteData.profile_medium,
-        profile: athleteData.profile,
+        id: athleteId,
+        first_name: athleteData.firstname,
+        last_name: athleteData.lastname,
+        email: athleteData.email,
+        sex: athleteData.sex,
+        weight: athleteData.weight || 0,
         city: athleteData.city,
         state: athleteData.state,
         country: athleteData.country,
-        premium: athleteData.premium,
+        premium: athleteData.premium || false,
         created_at: athleteData.created_at,
-        friend_count: athleteData.friend_count,
-        follower_count: athleteData.follower_count,
-        mutual_friend_count: athleteData.mutual_friend_count,
-        date_preference: athleteData.date_preference,
-        ftp: athleteData.ftp,
-        weight: athleteData.weight,
-        avatar_url: athleteData.profile // Using profile as avatar_url since it's the highest quality image
+        updated_at: new Date().toISOString()
     };
 
     // Convert any undefined values to null
@@ -303,42 +384,5 @@ function transformAthleteData(athleteId, athleteData) {
     return transformedData;
 }
 
-function transformAthleteStatsData(athleteId, athleteStatsData) {
-    // Extract the relevant stats from all_run_totals
-    const stats = athleteStatsData.all_run_totals || {};
-
-    const transformedData = {
-        user_id: athleteId,
-        count: stats.count,
-        distance: stats.distance,
-        moving_time: stats.moving_time,
-        elapsed_time: stats.elapsed_time,
-        elevation_gain: stats.elevation_gain,
-        achievement_count: stats.achievement_count
-    };
-
-    // Convert any undefined values to null
-    Object.keys(transformedData).forEach(key => {
-        if (transformedData[key] === undefined) {
-            transformedData[key] = null;
-        }
-    });
-
-    return transformedData;
-}
-
-function transformMapData(activityData) {
-    const transformedData = {
-        map_id: activityData.map.id,
-        summary_polyline: activityData.map.polyline
-    };
-
-    // Convert any undefined values to null
-    Object.keys(transformedData).forEach(key => {
-        if (transformedData[key] === undefined) {
-            transformedData[key] = null;
-        }
-    });
-
-    return transformedData;
-}
+// Note: athlete_stats and maps tables are not available in current schema
+// These functions have been removed to match the existing database structure

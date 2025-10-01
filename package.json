@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "engines": {
-    "node": "16.x"
+    "node": "20.x"
   },
   "scripts": {
     "start": "node index.js"
@@ -12,6 +12,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@supabase/supabase-js": "^2.58.0",
     "axios": "^1.8.4",
     "body-parser": "^1.20.2",
     "dotenv": "^16.4.7",
